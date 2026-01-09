@@ -2,9 +2,11 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import fetch from 'node-fetch';
 import https from 'https';
+import http from 'http';
 import crypto from 'crypto';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -163,8 +165,8 @@ class ProxmoxServer {
   }
 
   setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    // Store tools list for reuse by HTTP transport
+    this.tools = [
         {
           name: 'proxmox_get_nodes',
           description: 'List all Proxmox cluster nodes with their status and resources',
@@ -894,15 +896,23 @@ class ProxmoxServer {
             required: ['node', 'vmid', 'net']
           }
         }
-      ]
+    ];
+
+    // Register tools list handler
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: this.tools
     }));
 
+    // Register tool call handler
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
+      return this.handleToolCall(request.params.name, request.params.arguments || {});
+    });
+  }
 
-      try {
-        switch (name) {
-          case 'proxmox_get_nodes':
+  async handleToolCall(name, args) {
+    try {
+      switch (name) {
+        case 'proxmox_get_nodes':
             return await this.getNodes();
             
           case 'proxmox_get_node_status':
@@ -1079,8 +1089,7 @@ class ProxmoxServer {
             }
           ]
         };
-      }
-    });
+    }
   }
 
   async getNodes() {
@@ -3138,9 +3147,130 @@ class ProxmoxServer {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Proxmox MCP server running on stdio');
+    const transport = process.env.PROXMOX_MCP_TRANSPORT || 'stdio';
+    
+    if (transport === 'streamable-http' || transport === 'sse') {
+      await this.runHttpServer();
+    } else {
+      const stdioTransport = new StdioServerTransport();
+      await this.server.connect(stdioTransport);
+      console.error('Proxmox MCP server running on stdio');
+    }
+  }
+
+  async runHttpServer() {
+    const host = process.env.PROXMOX_MCP_HOST || '0.0.0.0';
+    const port = parseInt(process.env.PROXMOX_MCP_PORT || '6971', 10);
+    
+    // Track active sessions
+    const sessions = new Map();
+    
+    const httpServer = http.createServer(async (req, res) => {
+      // CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+      
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      
+      // Health check endpoint
+      if (url.pathname === '/health' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', transport: 'sse' }));
+        return;
+      }
+      
+      // SSE endpoint - client connects here to establish stream
+      if (url.pathname === '/sse' && req.method === 'GET') {
+        console.error(`New SSE connection from ${req.socket.remoteAddress}`);
+        
+        const sseTransport = new SSEServerTransport('/messages', res);
+        sessions.set(sseTransport.sessionId, sseTransport);
+        
+        // Clean up on close
+        res.on('close', () => {
+          console.error(`SSE connection closed: ${sseTransport.sessionId}`);
+          sessions.delete(sseTransport.sessionId);
+        });
+        
+        // Connect this transport to a new server instance
+        const sessionServer = new Server(
+          { name: 'proxmox-server', version: '1.0.0' },
+          { capabilities: { tools: {} } }
+        );
+        
+        // Copy tool handlers to session server
+        this.setupToolHandlersForServer(sessionServer);
+        
+        await sessionServer.connect(sseTransport);
+        await sseTransport.start();
+        return;
+      }
+      
+      // Messages endpoint - client POSTs messages here
+      if (url.pathname === '/messages' && req.method === 'POST') {
+        const sessionId = url.searchParams.get('sessionId');
+        
+        if (!sessionId || !sessions.has(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid or missing sessionId' }));
+          return;
+        }
+        
+        const sseTransport = sessions.get(sessionId);
+        await sseTransport.handlePostMessage(req, res);
+        return;
+      }
+      
+      // MCP info endpoint
+      if (url.pathname === '/mcp' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          name: 'proxmox-mcp-server',
+          version: '1.0.0',
+          transport: 'sse',
+          endpoints: {
+            sse: '/sse',
+            messages: '/messages'
+          }
+        }));
+        return;
+      }
+      
+      // 404 for unknown routes
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+    });
+    
+    httpServer.listen(port, host, () => {
+      console.error(`Proxmox MCP server running on http://${host}:${port}`);
+      console.error(`  SSE endpoint: http://${host}:${port}/sse`);
+      console.error(`  Messages endpoint: http://${host}:${port}/messages`);
+      console.error(`  Health check: http://${host}:${port}/health`);
+    });
+  }
+
+  setupToolHandlersForServer(targetServer) {
+    // Register tools list handler
+    targetServer.setRequestHandler(ListToolsRequestSchema, async () => {
+      return { tools: this.getToolsList() };
+    });
+    
+    // Register tool call handler
+    targetServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+      return this.handleToolCall(request.params.name, request.params.arguments || {});
+    });
+  }
+
+  getToolsList() {
+    // Return the tools array - this mirrors what's in setupToolHandlers
+    return this.tools || [];
   }
 }
 
